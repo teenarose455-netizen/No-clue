@@ -1,0 +1,8 @@
+backend/engine.py           profile + deterministic repair/audit engine (687 lines)
+backend/session.py          Session class: proposals, decisions, hash-chained ledger, report (391)
+backend/main.py             FastAPI HTTP API + session persistence (340)
+backend/samples/            demo dataset
+frontend/src/lib.ts         shared types + fetch client (182)
+frontend/src/App.tsx        root: upload vs workspace state (91)
+frontend/src/components/    Constellation, Upload, Workspace, Overview, Proposals, Output, Ledger, Report
+frontend/src/styles.css     full theme + motion layer (677)

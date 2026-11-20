@@ -1,0 +1,687 @@
+# -*- coding: utf-8 -*-
+"""DataFix engine: deterministic CSV profiling, issue detection and repair proposals.
+
+No network calls, no randomness. Every proposal carries a rule, a confidence and a
+human-readable reason so that the audit ledger can be reconstructed exactly.
+"""
+from __future__ import annotations
+
+import csv
+import hashlib
+import io
+import re
+from datetime import datetime
+
+NA_TOKENS = {
+    "", "na", "n/a", "n.a.", "nan", "null", "none", "nil", "-", "--", "?", "undefined",
+    "#n/a", "#value!", "(blank)", "(empty)",
+}
+BOOL_TOKENS = {
+    "true", "false", "yes", "no", "y", "n", "1", "0", "t", "f", "si", "sí",
+}
+ID_HINTS = ("id", "key", "code", "sku", "isbn", "ref", "number", "no", "uuid", "email")
+POSITIVE_HINTS = ("price", "amount", "total", "qty", "quantity", "cost", "revenue", "salary", "count")
+CURRENCY = "$€£₹¥₽₩"
+
+DATE_FORMATS = [
+    ("%Y-%m-%d", "ISO date"),
+    ("%Y/%m/%d", "slash year-first"),
+    ("%Y-%m-%dT%H:%M:%S", "ISO datetime"),
+    ("%Y-%m-%d %H:%M:%S", "ISO datetime"),
+    ("%d/%m/%Y", "day/month/year"),
+    ("%m/%d/%Y", "month/day/year"),
+    ("%d-%m-%Y", "day-month-year"),
+    ("%d.%m.%Y", "dot-separated"),
+    ("%b %d, %Y", "month name"),
+    ("%d %b %Y", "month name"),
+    ("%B %d, %Y", "month name"),
+    ("%B %d %Y", "month name"),
+    ("%b %d %Y", "month name"),
+    ("%d %B %Y", "month name"),
+    ("%d/%m/%y", "short year"),
+    ("%m/%d/%y", "short year"),
+    ("%Y%m%d", "compact"),
+]
+
+
+def pct(x: float) -> str:
+    return f"{x * 100:.1f}%"
+
+
+def _digest(prefix: str, *parts) -> str:
+    raw = "|".join(str(p) for p in parts).encode("utf-8")
+    return f"{prefix}_{hashlib.sha1(raw).hexdigest()[:10]}"
+
+
+def _clean(raw) -> str:
+    return "" if raw is None else str(raw)
+
+
+def is_na(raw) -> bool:
+    return _clean(raw).strip().lower() in NA_TOKENS
+
+
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s.replace("\u00a0", " ")).strip()
+
+
+def _cat_key(s: str) -> str:
+    """Aggressive comparison key used only to detect variants of one category."""
+    t = norm_space(s).lower()
+    t = re.sub(r"[.\-_,'`]", "", t)
+    t = re.sub(r"\b(inc|llc|ltd|co|corp|limited|company)\b\.?", "", t)
+    return re.sub(r"\s+", "", t)
+
+
+def parse_number(raw):
+    s = norm_space(_clean(raw))
+    if not s or is_na(s):
+        return None
+    s = s.replace("%", "").strip()
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg, s = True, s[1:-1]
+    for ch in CURRENCY:
+        s = s.replace(ch, "")
+    s = s.replace(",", "").replace(" ", "")
+    if s in ("", "-", "+", "."):
+        return None
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    if neg:
+        v = -v
+    if abs(v) > 1e18:
+        return None
+    return v
+
+
+def _fmt_num(v: float) -> str:
+    if v == int(v) and abs(v) < 1e15:
+        return str(int(v))
+    return repr(round(v, 6)).rstrip("0").rstrip(".")
+
+
+def parse_date(raw):
+    s = norm_space(_clean(raw))
+    if not s or is_na(s):
+        return None
+    for fmt, label in DATE_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        iso = dt.strftime("%Y-%m-%d")
+        # A day-first value that also parses month-first is intrinsically ambiguous.
+        ambiguous = fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d/%m/%y", "%m/%d/%y")
+        if ambiguous:
+            a, b = s.split("/")[0], s.split("/")[1] if "/" in s else ("", "")
+            if "/" in s:
+                try:
+                    ambiguous = int(a) <= 12 and int(b) <= 12 and a != b
+                except ValueError:
+                    pass
+        return iso, label, ambiguous
+    return None
+
+
+def sniff_delim(text: str) -> str:
+    head = "\n".join(text.splitlines()[:5])
+    best, best_score = ",", -1
+    for d in (",", ";", "\t", "|"):
+        try:
+            rows = list(csv.reader(io.StringIO(head), delimiter=d))
+        except csv.Error:
+            continue
+        widths = [len(r) for r in rows if r]
+        if not widths:
+            continue
+        score = widths[0] * 10 + sum(w == widths[0] for w in widths)
+        if score > best_score:
+            best, best_score = d, score
+    return best
+
+
+def load_csv_data(text: str) -> dict:
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    delim = sniff_delim(text)
+    reader = csv.reader(io.StringIO(text), delimiter=delim)
+    raw_rows = [r for r in reader]
+    while raw_rows and all(c.strip() == "" for c in raw_rows[-1]):
+        raw_rows.pop()
+    if not raw_rows:
+        return {"headers": [], "rows": [], "delim": delim, "ragged": []}
+    headers = [norm_space(h) or f"column_{i + 1}" for i, h in enumerate(raw_rows[0])]
+    body = raw_rows[1:]
+    ragged = [i for i, r in enumerate(body) if len(r) != len(headers)]
+    rows = []
+    for r in body:
+        if len(r) < len(headers):
+            r = list(r) + [""] * (len(headers) - len(r))
+        rows.append([_clean(c) for c in r[: len(headers)]])
+    return {"headers": headers, "rows": rows, "delim": delim, "ragged": ragged}
+
+
+def infer_types(headers: list[str], rows: list[list[str]]) -> list[str]:
+    types = []
+    n = len(rows)
+    for c, h in enumerate(headers):
+        vals = [_clean(r[c]) for r in rows]
+        present = [v for v in vals if not is_na(v)]
+        hl = h.strip().lower()
+        if not present:
+            types.append("empty")
+            continue
+        distinct = {norm_space(v) for v in present}
+        if len(distinct) >= 2 and all(v.lower() in BOOL_TOKENS for v in distinct):
+            types.append("bool")
+            continue
+        nums = [parse_number(v) for v in present]
+        num_ok = [x for x in nums if x is not None]
+        dates = [parse_date(v) for v in present]
+        date_ok = [x for x in dates if x is not None]
+        num_ratio = len(num_ok) / len(present)
+        date_ratio = len(date_ok) / len(present)
+        unique_ratio = len(distinct) / len(present)
+        segs = {s for s in re.split(r"[^a-z0-9]+", hl) if s}
+        looks_id_name = bool(segs & set(ID_HINTS)) or hl.endswith("id") or hl.endswith("code") or hl.endswith("sku")
+        all_int = num_ok and all(abs(x - int(x)) < 1e-9 for x in num_ok) and num_ratio > 0.98
+        avg_tokens = sum(len(v.split()) for v in present) / len(present)
+        avg_len = sum(len(v) for v in present) / len(present)
+        has_at = any("@" in v for v in present)
+        if date_ratio >= 0.9 and not (all_int and looks_id_name):
+            types.append("date")
+        elif n >= 3 and (looks_id_name or all_int) and (unique_ratio >= 0.995 or (looks_id_name and unique_ratio >= 0.85)):
+            types.append("id")
+        elif num_ratio >= 0.9:
+            types.append("num")
+        elif not has_at and avg_len <= 26 and (
+            len(distinct) <= max(2, min(24, int(len(present) * 0.45)))
+            or (avg_tokens <= 1.6 and len(distinct) <= 60)
+        ):
+            types.append("cat")
+        else:
+            types.append("text")
+    return types
+
+
+def _metrics(headers, rows, types) -> dict:
+    n = max(1, len(rows))
+    m = max(1, len(headers))
+    total = n * m
+    missing = invalid = whitespace = variant = 0
+    cat_keys: dict[int, dict[str, set]] = {}
+    for r in rows:
+        for c in range(m):
+            raw = _clean(r[c]) if c < len(r) else ""
+            if is_na(raw):
+                missing += 1
+                continue
+            if raw != norm_space(raw):
+                whitespace += 1
+            t = types[c]
+            if t == "num" and parse_number(raw) is None:
+                invalid += 1
+            elif t == "date" and parse_date(raw) is None:
+                invalid += 1
+            elif t == "cat":
+                cat_keys.setdefault(c, {}).setdefault(_cat_key(raw), set()).add(norm_space(raw))
+    for groups in cat_keys.values():
+        for spellings in groups.values():
+            if len(spellings) > 1:
+                variant += len(spellings) - 1
+    seen = set()
+    dup = 0
+    for r in rows:
+        key = tuple(norm_space(_clean(v)).lower() for v in r)
+        if key in seen:
+            dup += 1
+        seen.add(key)
+    completeness = 1 - missing / total
+    validity = 1 - invalid / total
+    uniqueness = 1 - dup / n
+    consistency = 1 - (whitespace + variant) / total
+    completeness = max(0.0, min(1.0, completeness))
+    validity = max(0.0, min(1.0, validity))
+    uniqueness = max(0.0, min(1.0, uniqueness))
+    consistency = max(0.0, min(1.0, consistency))
+    overall = 0.35 * completeness + 0.30 * validity + 0.20 * uniqueness + 0.15 * consistency
+    return {
+        "completeness": round(completeness * 100, 1),
+        "validity": round(validity * 100, 1),
+        "uniqueness": round(uniqueness * 100, 1),
+        "consistency": round(consistency * 100, 1),
+        "overall": round(overall * 100, 1),
+        "cells": {
+            "missing": missing,
+            "invalid": invalid,
+            "whitespace": whitespace,
+            "variant": variant,
+            "duplicateRows": dup,
+        },
+    }
+
+
+def _issue(sev, title, count, cause, action, typ, col=None, examples=None):
+    return {
+        "sev": sev,
+        "title": title,
+        "count": count,
+        "cause": cause,
+        "action": action,
+        "type": typ,
+        "col": col,
+        "examples": (examples or [])[:4],
+    }
+
+
+def _mode(values):
+    freq: dict[str, int] = {}
+    for v in values:
+        freq[v] = freq.get(v, 0) + 1
+    return max(freq.items(), key=lambda kv: (kv[1], kv[0]))[0] if freq else None
+
+
+def _median(values):
+    vals = sorted(values)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
+
+
+def rel_hold(rows: list[list[str]], rel: dict) -> float:
+    if not rows:
+        return 0.0
+    if rel["kind"] == "fd":
+        a, b = rel["A"], rel["B"]
+        groups: dict[str, dict[str, int]] = {}
+        for r in rows:
+            if a >= len(r) or b >= len(r):
+                continue
+            groups.setdefault(r[a], {})
+            groups[r[a]][r[b]] = groups[r[a]].get(r[b], 0) + 1
+        held = 0
+        for counts in groups.values():
+            held += max(counts.values())
+        return held / len(rows)
+    a, b, c = rel["a"], rel["b"], rel["c"]
+    op = rel.get("op", "mul")
+    held = 0
+    total = 0
+    for r in rows:
+        if max(a, b, c) >= len(r):
+            continue
+        x, y, z = parse_number(r[a]), parse_number(r[b]), parse_number(r[c])
+        if x is None or y is None or z is None:
+            continue
+        total += 1
+        expect = x * y if op == "mul" else x + y
+        scale = max(1.0, abs(expect))
+        if abs(expect - z) / scale <= 0.01:
+            held += 1
+    return held / total if total else 0.0
+
+
+def _relations(headers, rows, types) -> list[dict]:
+    rels: list[dict] = []
+    n = len(rows)
+    if n < 4:
+        return rels
+    cat_cols = [i for i, t in enumerate(types) if t in ("cat", "bool")]
+    num_cols = [i for i, t in enumerate(types) if t == "num"]
+    for ai in cat_cols[:10]:
+        for bi in cat_cols[:10]:
+            if ai == bi:
+                continue
+            uniq_b = len({r[bi] for r in rows})
+            if uniq_b < 2 or uniq_b > 12:
+                continue
+            hold = rel_hold(rows, {"kind": "fd", "A": ai, "B": bi})
+            if hold >= 0.995:
+                rels.append({"kind": "fd", "A": ai, "B": bi, "hold": hold})
+    # keep only informative directions (a coarser column determines a finer one)
+    rels = [r for r in rels if len({row[r["A"]] for row in rows}) > len({row[r["B"]] for row in rows})]
+    seen_formula: set[tuple] = set()
+    for ai in num_cols[:8]:
+        for bi in num_cols[:8]:
+            if bi == ai or (min(ai, bi), max(ai, bi)) in seen_formula:
+                continue
+            for ci in num_cols[:8]:
+                if ci in (ai, bi):
+                    continue
+                for op in ("mul", "add"):
+                    cand = {"kind": "formula", "a": ai, "b": bi, "c": ci, "op": op}
+                    hold = rel_hold(rows, cand)
+                    if hold >= 0.995:
+                        cand["hold"] = hold
+                        rels.append(cand)
+                        seen_formula.add((min(ai, bi), max(ai, bi)))
+                        break
+                else:
+                    continue
+                break
+    return rels[:16]
+
+
+def engine(headers: list[str], rows: list[list[str]], opts: dict | None = None) -> dict:
+    opts = opts or {}
+    impute = bool(opts.get("impute", True))
+    n = len(rows)
+    m = len(headers)
+    types = infer_types(headers, rows)
+    fixes: list[dict] = []
+    dels: list[dict] = []
+    issues: list[dict] = []
+
+    def add_fix(r, c, before, after, rule, conf, reason):
+        fixes.append({
+            "id": _digest("fx", r, c, rule, before, after),
+            "r": r,
+            "c": c,
+            "col": headers[c],
+            "before": before,
+            "after": after,
+            "rule": rule,
+            "conf": round(conf, 3),
+            "reason": reason,
+        })
+
+    # --- missing values -------------------------------------------------
+    missing_cols = []
+    for c in range(m):
+        miss = [r for r in range(n) if is_na(rows[r][c])]
+        if not miss:
+            continue
+        ratio = len(miss) / max(1, n)
+        missing_cols.append((c, len(miss), ratio))
+        sev = "high" if ratio >= 0.25 else "medium"
+        t = types[c]
+        strategy = "median" if t == "num" else "mode" if t in ("cat", "bool") else "none"
+        add_action = (
+            "Impute column median (review)" if strategy == "median"
+            else "Impute column mode (review)" if strategy == "mode"
+            else "Left untouched — no safe deterministic value"
+        )
+        issues.append(_issue(
+            sev,
+            f"Missing values in “{headers[c]}”",
+            len(miss),
+            "Empty or null-like tokens (" + ", ".join(sorted({rows[r][c].strip() or "(blank)" for r in miss})[:4]) + ") suggest an export join or a required field that was never validated.",
+            add_action,
+            "missing",
+            headers[c],
+            [f"row {r + 1}" for r in miss],
+        ))
+        if not impute or strategy == "none":
+            continue
+        if strategy == "median":
+            vals = [parse_number(rows[r][c]) for r in range(n)]
+            vals = [v for v in vals if v is not None]
+            fill = _median(vals)
+            if fill is None:
+                continue
+            after = _fmt_num(fill)
+            rule, conf = "impute-median", 0.58
+            reason = f"column median of {len(vals)} numeric values; statistical estimate"
+        else:
+            present = [norm_space(rows[r][c]) for r in range(n) if not is_na(rows[r][c])]
+            fill = _mode(present)
+            if fill is None:
+                continue
+            after = fill
+            rule, conf = "impute-mode", 0.55
+            reason = f"most frequent category ({present.count(fill)}/{len(present)} rows); statistical estimate"
+        for r in miss:
+            add_fix(r, c, rows[r][c], after, rule, conf, reason)
+
+    # --- whitespace, numeric format, dates, categories -------------------
+    canon: dict[int, dict[str, str]] = {}
+    for c in range(m):
+        if types[c] == "cat":
+            groups: dict[str, dict[str, int]] = {}
+            for r in range(n):
+                raw = rows[r][c]
+                if is_na(raw):
+                    continue
+                groups.setdefault(_cat_key(raw), {}).setdefault(norm_space(raw), 0)
+                groups[_cat_key(raw)][norm_space(raw)] += 1
+            mapping: dict[str, str] = {}
+            for key, spellings in groups.items():
+                if len(spellings) < 2:
+                    continue
+                best = max(spellings.items(), key=lambda kv: (kv[1], kv[0]))[0]
+                for spelling in spellings:
+                    mapping[norm_space(spelling).lower()] = best
+            canon[c] = mapping
+
+    for r in range(n):
+        for c in range(m):
+            raw = _clean(rows[r][c])
+            if is_na(raw):
+                continue
+            t = types[c]
+            if raw != norm_space(raw):
+                add_fix(r, c, raw, norm_space(raw), "whitespace", 0.99,
+                        "leading/trailing or repeated whitespace")
+                continue
+            if t == "num":
+                v = parse_number(raw)
+                if v is not None:
+                    after = _fmt_num(v)
+                    plain = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", raw) is not None
+                    if after != raw and not plain:
+                        notes = []
+                        if "," in raw:
+                            notes.append("thousands separator")
+                        if any(ch in raw for ch in CURRENCY):
+                            notes.append("currency symbol")
+                        if raw.strip().startswith("("):
+                            notes.append("accounting negative")
+                        if "%" in raw:
+                            notes.append("percent sign")
+                        add_fix(r, c, raw, after, "numeric-normalize", 0.95,
+                                "numeric value written as text" + (f" ({', '.join(notes)})" if notes else ""))
+            elif t == "date":
+                pd = parse_date(raw)
+                if pd and pd[0] != raw:
+                    iso, label, ambiguous = pd
+                    conf = 0.45 if ambiguous else 0.93
+                    reason = ("ambiguous day/month order — both readings valid, kept below auto-apply"
+                              if ambiguous else f"{label} normalised to ISO 8601")
+                    add_fix(r, c, raw, iso, "date-normalize", conf, reason)
+            elif t == "cat":
+                key = norm_space(raw).lower()
+                best = canon.get(c, {}).get(key)
+                if best and best != raw:
+                    add_fix(r, c, raw, best, "category-canonical", 0.9,
+                            "spelling variant of an existing category value")
+            elif t == "text":
+                collapsed = norm_space(raw)
+                if collapsed != raw:
+                    add_fix(r, c, raw, collapsed, "whitespace", 0.97,
+                            "repeated internal whitespace")
+
+    # --- duplicate rows --------------------------------------------------
+    seen: dict[tuple, int] = {}
+    dupe_rows = []
+    for r in range(n):
+        key = tuple(norm_space(_clean(v)).lower() for v in rows[r])
+        if all(k == "" for k in key):
+            continue
+        if key in seen:
+            dupe_rows.append(r)
+            dels.append({
+                "id": _digest("dx", r, "duplicate-row"),
+                "r": r,
+                "rule": "duplicate-row",
+                "conf": 0.86,
+                "reason": f"byte-identical to row {seen[key] + 1} after trimming",
+                "keep": seen[key],
+            })
+        else:
+            seen[key] = r
+    if dupe_rows:
+        issues.append(_issue(
+            "medium",
+            "Duplicate records",
+            len(dupe_rows),
+            "The same record appears more than once, typically from concatenating exports or a retried load.",
+            f"Remove {len(dupe_rows)} later duplicate(s), keeping the first occurrence",
+            "duplicate",
+            None,
+            [f"row {r + 1}" for r in dupe_rows],
+        ))
+
+    # --- duplicate keys ---------------------------------------------------
+    for c, t in enumerate(types):
+        if t != "id":
+            continue
+        first: dict[str, int] = {}
+        dups = []
+        for r in range(n):
+            raw = norm_space(rows[r][c])
+            if is_na(raw) or r in dupe_rows:
+                continue
+            if raw in first:
+                dups.append((r, first[raw]))
+            else:
+                first[raw] = r
+        if not dups:
+            continue
+        issues.append(_issue(
+            "high",
+            f"Duplicate keys in “{headers[c]}”",
+            len(dups),
+            "The column is used as a record identifier but repeats, so joins on it will fan out rows.",
+            "Proposed removals require review — identity conflicts are not auto-resolved",
+            "dupkey",
+            headers[c],
+            [f"row {r + 1} (first at {f + 1})" for r, f in dups],
+        ))
+        for r, f in dups:
+            dels.append({
+                "id": _digest("dx", r, "duplicate-key", headers[c], rows[r][c]),
+                "r": r,
+                "rule": "duplicate-key",
+                "conf": 0.5,
+                "reason": f"key “{rows[r][c]}” already used by row {f + 1}",
+                "keep": f,
+            })
+
+    # --- invalid values (no safe fix) ------------------------------------
+    for c, t in enumerate(types):
+        if t not in ("num", "date"):
+            continue
+        bad = []
+        for r in range(n):
+            raw = rows[r][c]
+            if is_na(raw):
+                continue
+            if (t == "num" and parse_number(raw) is None) or (t == "date" and parse_date(raw) is None):
+                bad.append((r, raw))
+        if not bad:
+            continue
+        kind = "numeric" if t == "num" else "date"
+        issues.append(_issue(
+            "high",
+            f"Unparseable {kind} values in “{headers[c]}”",
+            len(bad),
+            f"The column is otherwise {kind}, so these tokens were probably free text typed into a typed field.",
+            "Flagged only — no deterministic repair exists",
+            "invalid",
+            headers[c],
+            [f"“{v}”" for _, v in bad[:3]],
+        ))
+
+    # --- outliers (flag only) --------------------------------------------
+    for c, t in enumerate(types):
+        if t != "num":
+            continue
+        pairs = [(r, parse_number(rows[r][c])) for r in range(n)]
+        pairs = [(r, v) for r, v in pairs if v is not None]
+        if len(pairs) < 8:
+            continue
+        vals = sorted(v for _, v in pairs)
+        q1 = vals[len(vals) // 4]
+        q3 = vals[(3 * len(vals)) // 4]
+        iqr = q3 - q1
+        if iqr <= 0:
+            continue
+        lo, hi = q1 - 3 * iqr, q3 + 3 * iqr
+        out = [(r, v) for r, v in pairs if v < lo or v > hi]
+        if out:
+            issues.append(_issue(
+                "low",
+                f"Statistical outliers in “{headers[c]}”",
+                len(out),
+                "Values sit far outside the interquartile range; could be legitimate extremes or unit errors.",
+                "Flagged only — outliers are never altered",
+                "outlier",
+                headers[c],
+                [f"row {r + 1}: {_fmt_num(v)}" for r, v in out[:3]],
+            ))
+        hl = headers[c].lower()
+        if any(tok in hl for tok in POSITIVE_HINTS):
+            neg = [(r, v) for r, v in pairs if v < 0]
+            if neg:
+                issues.append(_issue(
+                    "medium",
+                    f"Negative values in “{headers[c]}”",
+                    len(neg),
+                    "A quantity or price is negative, which usually means a sign or refund encoding leaked into the fact column.",
+                    "Flagged only — business meaning decides the correct value",
+                    "negative",
+                    headers[c],
+                    [f"row {r + 1}: {_fmt_num(v)}" for r, v in neg[:3]],
+                ))
+
+    # --- structural issues ------------------------------------------------
+    ragged = opts.get("ragged") or []
+    if ragged:
+        issues.append(_issue(
+            "high",
+            "Ragged rows",
+            len(ragged),
+            "Records have a different number of fields than the header — an unquoted delimiter is the usual cause.",
+            "Rows padded/truncated to schema width; verify them manually",
+            "ragged",
+            None,
+            [f"row {r + 2}" for r in ragged[:3]],
+        ))
+    for c in range(m):
+        present = [rows[i][c] for i in range(n) if not is_na(rows[i][c])]
+        if n and len(present) == 0:
+            issues.append(_issue("info", f"Empty column “{headers[c]}”", n,
+                                 "The column carries no values at all.", "Candidate for removal", "empty", headers[c]))
+        elif present and len({norm_space(v) for v in present}) == 1:
+            issues.append(_issue("info", f"Constant column “{headers[c]}”", len(present),
+                                 "Every record stores the same value, so the column has no analytical variance.",
+                                 "Kept — may be metadata", "constant", headers[c]))
+
+    fixes.sort(key=lambda f: (f["r"], f["c"]))
+    dels.sort(key=lambda d: d["r"])
+    sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    issues.sort(key=lambda i: (sev_rank.get(i["sev"], 5), -i["count"]))
+
+    return {
+        "headers": headers,
+        "rows": rows,
+        "types": types,
+        "fixes": fixes,
+        "dels": dels,
+        "issues": issues,
+        "metrics": _metrics(headers, rows, types),
+        "relations": _relations(headers, rows, types),
+    }
+
+
+def to_csv(headers: list[str], rows: list[list[str]], delim: str = ",") -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=delim or ",", lineterminator="\n")
+    w.writerow(headers)
+    for r in rows:
+        w.writerow(["" if v is None else str(v) for v in r])
+    return buf.getvalue()
